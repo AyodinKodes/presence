@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Presence</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: none; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="field"></canvas>
+<script>
+// ---- Tunables -------------------------------------------------------------
+const CELL       = 8;      // cell size in CSS px
+const GAP        = 1;      // black gap between cells in CSS px (0 = no visible grid)
+const TRAIL      = 300;    // ms a cell stays lit after a cursor leaves it
+const TRAIL_FADE = 120;    // last part of TRAIL spent fading -> black
+const HOLD       = 8000;   // ms a painted trace stays at full colour
+const FADE       = 20000;  // ms to fade from full colour down to residue
+const RESIDUE    = 0.15;   // opacity a trace keeps forever
+const GREEN      = [0, 255, 90];
+const PINK       = [255, 40, 150];
+const ORANGE     = [255, 140, 0];
+const BLUE       = [30, 90, 255];
+// Index = cursor size - 1:  1 person, 2 people, 3 people
+const PRESENCE   = [GREEN, ORANGE, BLUE];   // live cursor + trail colour
+const PAINT      = [PINK, ORANGE, BLUE];    // painted trace colour
+
+// ---- State ----------------------------------------------------------------
+// Cells are keyed by (row, col) on a shared grid anchored at the top-left.
+const KEY = (c, r) => r * 100000 + c;
+const UNKEY = key => { const r = Math.floor(key / 100000); return [key - r * 100000, r]; };
+// One layer per paint colour: residue (permanent opacity) + active deposits still fading.
+const traces = PAINT.map(() => ({ residue: new Map(), active: new Map() }));
+const trail = new Map();     // key -> [time last lit, colour index]
+let entities = [];           // from server: [id, c, r, size, painting]
+const lastPos = new Map();   // entity id -> {c, r, s}, for interpolating trails
+
+// Layering translucent deposits: each one covers a fraction of what's left.
+const layer = (base, a) => 1 - (1 - base) * (1 - a);
+
+function depositAlpha(age) {
+  if (age < HOLD) return 1;
+  const t = Math.min(1, (age - HOLD) / FADE);
+  return 1 - (1 - RESIDUE) * (1 - Math.pow(1 - t, 2)); // ease-out toward residue
+}
+
+// ---- Canvas setup ---------------------------------------------------------
+const canvas = document.getElementById('field');
+const ctx = canvas.getContext('2d');
+const small = document.createElement('canvas');  // 1 pixel per cell
+const sctx = small.getContext('2d');
+const grid = document.createElement('canvas');   // gap overlay, drawn once per resize
+let cols, rows, img, buf, dpr, alpha;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  cols = Math.ceil(innerWidth / CELL);
+  rows = Math.ceil(innerHeight / CELL);
+  canvas.width  = grid.width  = Math.round(cols * CELL * dpr);
+  canvas.height = grid.height = Math.round(rows * CELL * dpr);
+  canvas.style.width  = cols * CELL + 'px';
+  canvas.style.height = rows * CELL + 'px';
+  small.width = cols; small.height = rows;
+  img = sctx.createImageData(cols, rows);
+  buf = new Uint32Array(img.data.buffer);
+  alpha = PAINT.map(() => new Float32Array(cols * rows));
+
+  const g = grid.getContext('2d');
+  g.clearRect(0, 0, grid.width, grid.height);
+  if (GAP > 0) {
+    g.fillStyle = '#000';
+    const s = CELL * dpr, w = Math.max(1, Math.round(GAP * dpr));
+    for (let c = 0; c <= cols; c++) g.fillRect(Math.round(c * s), 0, w, grid.height);
+    for (let r = 0; r <= rows; r++) g.fillRect(0, Math.round(r * s), grid.width, w);
+  }
+}
+addEventListener('resize', resize);
+resize();
+
+// ---- Network --------------------------------------------------------------
+let ws;
+function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
+
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    if (m.t === 'init') receiveSnapshot(m.cells);
+    if (m.t === 's') receiveEntities(m.e);
+    if (m.t === 'p') receiveDeposits(m.d);
+  };
+  ws.onclose = () => setTimeout(connect, 1000);
+}
+connect();
+
+function receiveSnapshot(list) {
+  const now = performance.now();
+  for (const t of traces) { t.residue.clear(); t.active.clear(); }
+  for (const [c, r, ci, settled, ages] of list) {
+    const key = KEY(c, r), t = traces[ci];
+    if (settled) t.residue.set(key, 1 - Math.pow(1 - RESIDUE, settled));
+    if (ages.length) t.active.set(key, ages.map(a => now - a));
+  }
+}
+
+function receiveDeposits(d) {
+  const now = performance.now();
+  for (let i = 0; i < d.length; i += 3) {
+    const key = KEY(d[i], d[i + 1]), t = traces[d[i + 2]];
+    if (!t.active.has(key)) t.active.set(key, []);
+    t.active.get(key).push(now);
+    trail.delete(key);                      // paint takes priority over trails
+  }
+}
+
+function stampFoot(c, r, s, now) {
+  for (let y = r; y < r + s; y++) for (let x = c; x < c + s; x++) trail.set(KEY(x, y), [now, s - 1]);
+}
+
+// Light every footprint position between the last known position and the new one.
+function receiveEntities(list) {
+  const now = performance.now(), ids = new Set();
+  for (const [id, c, r, s, painting] of list) {
+    ids.add(id);
+    const p = lastPos.get(id);
+    if (!painting && p && p.s === s) {
+      const dc = c - p.c, dr = r - p.r, steps = Math.max(Math.abs(dc), Math.abs(dr));
+      for (let i = 1; i < steps; i++)
+        stampFoot(Math.round(p.c + dc * i / steps), Math.round(p.r + dr * i / steps), s, now);
+    }
+    lastPos.set(id, { c, r, s });
+  }
+  for (const id of lastPos.keys()) if (!ids.has(id)) lastPos.delete(id);
+  entities = list;
+}
+
+// ---- Input ----------------------------------------------------------------
+// The server decides what each movement means (solo, group, painting or not).
+let down = false, last = null;
+const cellOf = e => [Math.max(0, Math.floor(e.clientX / CELL)), Math.max(0, Math.floor(e.clientY / CELL))];
+
+canvas.addEventListener('pointermove', e => {
+  const [c, r] = cellOf(e);
+  if (last && last[0] === c && last[1] === r) return;
+  last = [c, r];
+  send({ t: 'm', c, r });
+});
+canvas.addEventListener('pointerdown', e => {
+  canvas.setPointerCapture(e.pointerId);
+  down = true;
+  last = cellOf(e);
+  send({ t: 'd', c: last[0], r: last[1] });
+});
+const release = () => { if (down) { down = false; send({ t: 'u' }); } };
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+addEventListener('blur', release);
+canvas.addEventListener('pointerleave', () => {
+  if (!down) { last = null; send({ t: 'l' }); }
+});
+
+// ---- Render ---------------------------------------------------------------
+const BLACK = 0xff000000;
+const pack = (r, g, b) => (255 << 24) | (b << 16) | (g << 8) | r;
+
+// Mix colour (opacity a) over whatever is already in the cell.
+function blend(c, r, rgb, a) {
+  if (c < 0 || r < 0 || c >= cols || r >= rows) return;
+  const i = r * cols + c, p = buf[i];
+  const mix = (under, over) => under + (over - under) * a;
+  buf[i] = pack(mix(p & 255, rgb[0]), mix((p >> 8) & 255, rgb[1]), mix((p >> 16) & 255, rgb[2]));
+}
+
+function frame() {
+  const now = performance.now();
+
+  // 1. painted traces: opacity per colour per cell
+  traces.forEach((t, ci) => {
+    const A = alpha[ci];
+    A.fill(0);
+    for (const [key, a] of t.residue) {
+      const [c, r] = UNKEY(key);
+      if (c < cols && r < rows) A[r * cols + c] = a;
+    }
+    for (const [key, stamps] of t.active) {
+      for (let i = stamps.length - 1; i >= 0; i--) {
+        if (now - stamps[i] >= HOLD + FADE) {        // fully settled: fold into permanent residue
+          t.residue.set(key, layer(t.residue.get(key) || 0, RESIDUE));
+          stamps.splice(i, 1);
+        }
+      }
+      let a = t.residue.get(key) || 0;
+      for (const s of stamps) a = layer(a, depositAlpha(now - s));
+      if (!stamps.length) t.active.delete(key);
+      const [c, r] = UNKEY(key);
+      if (c < cols && r < rows) A[r * cols + c] = a;
+    }
+  });
+  for (let i = 0; i < buf.length; i++) {
+    let R = 0, G = 0, B = 0, any = false;
+    for (let ci = 0; ci < PAINT.length; ci++) {
+      const a = alpha[ci][i];
+      if (!a) continue;
+      any = true;
+      const col = PAINT[ci];
+      R += (col[0] - R) * a; G += (col[1] - G) * a; B += (col[2] - B) * a;
+    }
+    buf[i] = any ? pack(R, G, B) : BLACK;
+  }
+
+  // 2. live cursors keep their cells lit; they become trail once the cursor moves on
+  for (const [, c, r, s, painting] of entities) if (!painting) stampFoot(c, r, s, now);
+
+  // 3. trails: full colour, then a short fade out
+  for (const [key, [t, ci]] of trail) {
+    const age = now - t;
+    if (age >= TRAIL) { trail.delete(key); continue; }
+    const [c, r] = UNKEY(key);
+    blend(c, r, PRESENCE[ci], Math.min(1, (TRAIL - age) / TRAIL_FADE));
+  }
+
+  sctx.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(small, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(grid, 0, 0);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
