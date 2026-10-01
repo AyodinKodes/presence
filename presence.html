@@ -24,9 +24,15 @@ const GREEN      = [0, 255, 90];
 const PINK       = [255, 40, 150];
 const ORANGE     = [255, 140, 0];
 const BLUE       = [30, 90, 255];
-// Index = cursor size - 1:  1 person, 2 people, 3 people
-const PRESENCE   = [GREEN, ORANGE, BLUE];   // live cursor + trail colour
-const PAINT      = [PINK, ORANGE, BLUE];    // painted trace colour
+const YELLOW     = [255, 220, 0];
+const PURPLE     = [170, 60, 255];
+const RED        = [255, 30, 30];
+const ERASE_TRAIL      = 120;  // ms the red eraser trail stays visible (visual only)
+const ERASE_TRAIL_FADE = 80;
+// Index = cursor size - 1:  1 … 5 people
+const PRESENCE   = [GREEN, ORANGE, BLUE, YELLOW, PURPLE];   // live cursor + trail colour
+const PAINT      = [PINK, ORANGE, BLUE, YELLOW, PURPLE];    // painted trace colour
+const ERASER     = PRESENCE.length;                         // trail colour index for red
 
 // ---- State ----------------------------------------------------------------
 // Cells are keyed by (row, col) on a shared grid anchored at the top-left.
@@ -35,7 +41,7 @@ const UNKEY = key => { const r = Math.floor(key / 100000); return [key - r * 100
 // One layer per paint colour: residue (permanent opacity) + active deposits still fading.
 const traces = PAINT.map(() => ({ residue: new Map(), active: new Map() }));
 const trail = new Map();     // key -> [time last lit, colour index]
-let entities = [];           // from server: [id, c, r, size, painting]
+let entities = [];           // from server: [id, c, r, size, painting, erase]
 const lastPos = new Map();   // entity id -> {c, r, s}, for interpolating trails
 
 // Layering translucent deposits: each one covers a fraction of what's left.
@@ -91,7 +97,9 @@ function connect() {
     if (m.t === 'init') receiveSnapshot(m.cells);
     if (m.t === 's') receiveEntities(m.e);
     if (m.t === 'p') receiveDeposits(m.d);
+    if (m.t === 'x') receiveErased(m.d);
   };
+  ws.onopen = () => { if (erasing) send({ t: 'e', v: 1 }); };
   ws.onclose = () => setTimeout(connect, 1000);
 }
 connect();
@@ -116,20 +124,29 @@ function receiveDeposits(d) {
   }
 }
 
-function stampFoot(c, r, s, now) {
-  for (let y = r; y < r + s; y++) for (let x = c; x < c + s; x++) trail.set(KEY(x, y), [now, s - 1]);
+// Erased cells lose everything: all colours, all deposits, all residue.
+function receiveErased(d) {
+  for (let i = 0; i < d.length; i += 2) {
+    const key = KEY(d[i], d[i + 1]);
+    for (const t of traces) { t.residue.delete(key); t.active.delete(key); }
+  }
 }
+
+function stampFoot(c, r, s, now, ci) {
+  for (let y = r; y < r + s; y++) for (let x = c; x < c + s; x++) trail.set(KEY(x, y), [now, ci]);
+}
+const colourOf = (s, erase) => erase ? ERASER : s - 1;
 
 // Light every footprint position between the last known position and the new one.
 function receiveEntities(list) {
   const now = performance.now(), ids = new Set();
-  for (const [id, c, r, s, painting] of list) {
+  for (const [id, c, r, s, painting, erase] of list) {
     ids.add(id);
     const p = lastPos.get(id);
     if (!painting && p && p.s === s) {
       const dc = c - p.c, dr = r - p.r, steps = Math.max(Math.abs(dc), Math.abs(dr));
       for (let i = 1; i < steps; i++)
-        stampFoot(Math.round(p.c + dc * i / steps), Math.round(p.r + dr * i / steps), s, now);
+        stampFoot(Math.round(p.c + dc * i / steps), Math.round(p.r + dr * i / steps), s, now, colourOf(s, erase));
     }
     lastPos.set(id, { c, r, s });
   }
@@ -161,6 +178,33 @@ addEventListener('blur', release);
 canvas.addEventListener('pointerleave', () => {
   if (!down) { last = null; send({ t: 'l' }); }
 });
+
+// ---- Erase mode: held while Shift, Delete or Backspace is down -------------
+const ERASE_KEYS = new Set(['Shift', 'Delete', 'Backspace']);
+const held = new Set();
+let erasing = false;
+function syncErase() {
+  const on = held.size > 0;
+  if (on !== erasing) { erasing = on; send({ t: 'e', v: on ? 1 : 0 }); }
+}
+addEventListener('keydown', e => {
+  if (!ERASE_KEYS.has(e.key)) return;
+  if (e.key !== 'Shift') e.preventDefault();   // no "back" navigation
+  held.add(e.key); syncErase();
+});
+addEventListener('keyup', e => {
+  if (!ERASE_KEYS.has(e.key)) return;
+  e.preventDefault();
+  held.delete(e.key); syncErase();
+});
+// Never get stuck: drop the mode when focus or the tab is lost,
+// and trust the pointer's own Shift state if a keyup was missed.
+const dropErase = () => { held.clear(); syncErase(); };
+addEventListener('blur', dropErase);
+document.addEventListener('visibilitychange', () => { if (document.hidden) dropErase(); });
+canvas.addEventListener('pointermove', e => {
+  if (!e.shiftKey && held.has('Shift')) { held.delete('Shift'); syncErase(); }
+}, true);
 
 // ---- Render ---------------------------------------------------------------
 const BLACK = 0xff000000;
@@ -212,14 +256,15 @@ function frame() {
   }
 
   // 2. live cursors keep their cells lit; they become trail once the cursor moves on
-  for (const [, c, r, s, painting] of entities) if (!painting) stampFoot(c, r, s, now);
+  for (const [, c, r, s, painting, erase] of entities) if (!painting) stampFoot(c, r, s, now, colourOf(s, erase));
 
-  // 3. trails: full colour, then a short fade out
+  // 3. trails: full colour, then a short fade out (red eraser trail is shorter)
   for (const [key, [t, ci]] of trail) {
     const age = now - t;
-    if (age >= TRAIL) { trail.delete(key); continue; }
+    const life = ci === ERASER ? ERASE_TRAIL : TRAIL, fade = ci === ERASER ? ERASE_TRAIL_FADE : TRAIL_FADE;
+    if (age >= life) { trail.delete(key); continue; }
     const [c, r] = UNKEY(key);
-    blend(c, r, PRESENCE[ci], Math.min(1, (TRAIL - age) / TRAIL_FADE));
+    blend(c, r, ci === ERASER ? RED : PRESENCE[ci], Math.min(1, (life - age) / fade));
   }
 
   sctx.putImageData(img, 0, 0);

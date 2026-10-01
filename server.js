@@ -8,7 +8,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT      = process.env.PORT || 3000;
-const MAX_USERS = 3;            // active participants; extra connections only watch
+const MAX_USERS = 5;          // active participants; extra connections only watch
 const NEAR      = 4;            // ±cells horizontally and vertically to count as "nearby"
 const SETTLE    = 8000 + 20000; // HOLD + FADE in presence.html: after this a trace is pure residue
 
@@ -24,9 +24,9 @@ const server = http.createServer((req, res) => {
 
 // ---- State ----------------------------------------------------------------
 let nextId = 1;
-const users = new Map();   // ws -> { id, c, r, down }   (c === null: not on the canvas)
+const users = new Map();   // ws -> { id, c, r, down, erase }   (c === null: not on the canvas)
 const entPrev = new Map(); // entity id -> { c, r, painting } from the previous update
-// Painted traces: key -> [ {settled, stamps[]} for color 0 (pink), 1 (orange), 2 (blue) ]
+// Painted traces: key -> [ {settled, stamps[]} per colour: 0 pink, 1 orange, 2 blue, 3 yellow, 4 purple ]
 const cells = new Map();
 const KEY = (c, r) => r * 100000 + c;
 
@@ -36,44 +36,68 @@ const near = (a, b) => Math.abs(a.c - b.c) <= NEAR && Math.abs(a.r - b.r) <= NEA
 // First MAX_USERS connections (by join order) are the active participants.
 const activeUsers = () => [...users.values()].sort((a, b) => a.id - b.id).slice(0, MAX_USERS);
 
-// Deterministic grouping:
-//  - all three merge only if every pair is near (no chains)
-//  - otherwise the closest nearby pair merges (ties broken by join order)
-//  - everyone else is on their own
+// A set of people is a group only if EVERY pair is near (no chains).
+const isGroup = set => set.every((a, i) => set.slice(i + 1).every(b => near(a, b)));
+
+// Ranking between candidate groups: bigger first, then tighter (largest pairwise
+// distance, then sum of pairwise distances), then join order. Fully deterministic.
+function score(set) {
+  let spread = 0, sum = 0;
+  for (let i = 0; i < set.length; i++) for (let j = i + 1; j < set.length; j++) {
+    const dc = Math.abs(set[i].c - set[j].c), dr = Math.abs(set[i].r - set[j].r);
+    spread = Math.max(spread, dc, dr); sum += dc + dr;
+  }
+  return [-set.length, spread, sum, ...set.map(u => u.id)];
+}
+const better = (a, b) => { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] < b[i]; return false; };
+
+// Partition people into groups: repeatedly take the best valid group among those left.
+// With at most 5 people this simply tries every subset.
+function partition(ps) {
+  const out = [];
+  let left = ps.slice();
+  while (left.length) {
+    let best = null, bestScore = null;
+    for (let mask = 1; mask < (1 << left.length); mask++) {
+      const set = left.filter((_, i) => mask & (1 << i));
+      if (!isGroup(set)) continue;
+      const sc = score(set);
+      if (!best || better(sc, bestScore)) { best = set; bestScore = sc; }
+    }
+    out.push(best);
+    left = left.filter(u => !best.includes(u));
+  }
+  return out;
+}
+
+// Erasers only group with erasers; everyone else only with non-erasers.
 function groups() {
   const ps = activeUsers().filter(u => u.c !== null);
-  if (ps.length === 3 && near(ps[0], ps[1]) && near(ps[1], ps[2]) && near(ps[0], ps[2])) return [ps];
-  let best = null;
-  for (let i = 0; i < ps.length; i++) for (let j = i + 1; j < ps.length; j++) {
-    const a = ps[i], b = ps[j];
-    if (!near(a, b)) continue;
-    const dc = Math.abs(a.c - b.c), dr = Math.abs(a.r - b.r);
-    const score = [Math.max(dc, dr), dc + dr];
-    if (!best || score[0] < best.score[0] || (score[0] === best.score[0] && score[1] < best.score[1]))
-      best = { score, pair: [a, b] };
-  }
-  if (!best) return ps.map(u => [u]);
-  return [best.pair, ...ps.filter(u => !best.pair.includes(u)).map(u => [u])];
+  return [
+    ...partition(ps.filter(u => !u.erase)).map(m => ({ members: m, erase: false })),
+    ...partition(ps.filter(u => u.erase)).map(m => ({ members: m, erase: true })),
+  ];
 }
 
 // A group becomes one entity: size = member count, centred on the members' mean position.
-function entity(members) {
+function entity({ members, erase }) {
   const s = members.length;
   const mc = members.reduce((t, u) => t + u.c, 0) / s;
   const mr = members.reduce((t, u) => t + u.r, 0) / s;
   return {
-    id: members.map(u => u.id).join('-'),
+    id: (erase ? 'x' : '') + members.map(u => u.id).join('-'),
     s,
+    erase,
     c: Math.max(0, Math.round(mc + 0.5 - s / 2)),   // top-left cell of the s×s footprint
     r: Math.max(0, Math.round(mr + 0.5 - s / 2)),
-    painting: members.every(u => u.down),          // collective intention: everyone presses
+    painting: !erase && members.every(u => u.down), // collective intention: everyone presses
   };
 }
 
 // ---- Painting ---------------------------------------------------------------
 function deposit(c, r, ci, out) {
   const key = KEY(c, r);
-  if (!cells.has(key)) cells.set(key, [0, 1, 2].map(() => ({ settled: 0, stamps: [] })));
+  if (!cells.has(key)) cells.set(key, [0, 1, 2, 3, 4].map(() => ({ settled: 0, stamps: [] })));
   cells.get(key)[ci].stamps.push(Date.now());
   out.push(c, r, ci);
 }
@@ -86,13 +110,28 @@ function depositFoot(c, r, s, out, pc = null, pr = null) {
     if (pc === null || !inFoot(x, y, pc, pr, s)) deposit(x, y, s - 1, out);
 }
 
+// ---- Erasing ----------------------------------------------------------------
+// Removes the stored cell entirely: every colour, every deposit, all residue.
+function eraseFoot(c, r, s, out) {
+  for (let y = r; y < r + s; y++) for (let x = c; x < c + s; x++)
+    if (cells.delete(KEY(x, y))) out.push(x, y);
+}
+
 // ---- Update loop ------------------------------------------------------------
 function update() {
   const ents = groups().map(entity);
-  const deposits = [];
+  const deposits = [], erased = [];
   for (const e of ents) {
     const p = entPrev.get(e.id);
-    if (e.painting) {
+    if (e.erase) {
+      // erase the whole footprint at every step between the previous and new position
+      if (p) {
+        const dc = e.c - p.c, dr = e.r - p.r, steps = Math.max(Math.abs(dc), Math.abs(dr));
+        for (let i = 1; i <= steps; i++)
+          eraseFoot(Math.round(p.c + dc * i / steps), Math.round(p.r + dr * i / steps), e.s, erased);
+      }
+      eraseFoot(e.c, e.r, e.s, erased);
+    } else if (e.painting) {
       if (p && p.painting) {
         // walk from the previous footprint position to the new one so strokes have no gaps
         const dc = e.c - p.c, dr = e.r - p.r, steps = Math.max(Math.abs(dc), Math.abs(dr));
@@ -111,7 +150,8 @@ function update() {
   entPrev.clear();
   for (const e of ents) entPrev.set(e.id, { c: e.c, r: e.r, painting: e.painting });
 
-  broadcast({ t: 's', e: ents.map(e => [e.id, e.c, e.r, e.s, e.painting ? 1 : 0]) });
+  broadcast({ t: 's', e: ents.map(e => [e.id, e.c, e.r, e.s, e.painting ? 1 : 0, e.erase ? 1 : 0]) });
+  if (erased.length) broadcast({ t: 'x', d: erased });
   if (deposits.length) broadcast({ t: 'p', d: deposits });
 }
 
@@ -187,7 +227,7 @@ function accept(req, socket, onConnection) {
 // ---- Connections ------------------------------------------------------------
 server.on('upgrade', (req, socket) => accept(req, socket, onConnection));
 function onConnection(ws) {
-  const user = { id: nextId++, c: null, r: null, down: false };
+  const user = { id: nextId++, c: null, r: null, down: false, erase: false };
   users.set(ws, user);
   ws.send(JSON.stringify(snapshot()));
   update();
@@ -198,6 +238,7 @@ function onConnection(ws) {
     if (m.t === 'd') user.down = true;
     if (m.t === 'u') user.down = false;
     if (m.t === 'l') { user.c = user.r = null; user.down = false; }
+    if (m.t === 'e') user.erase = !!m.v;   // erase mode on/off (Shift, Delete, Backspace)
     update();
   };
   ws.onclose = () => { users.delete(ws); update(); };
