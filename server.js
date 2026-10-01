@@ -9,7 +9,9 @@ const crypto = require('crypto');
 
 const PORT      = process.env.PORT || 3000;
 const MAX_USERS = 5;          // active participants; extra connections only watch
-const NEAR      = 4;            // ±cells horizontally and vertically to count as "nearby"
+// Proximity field per group size: every pair in a group of N people must be within
+// ±NEAR[N] cells horizontally and vertically. Bigger groups get a bigger field. Tune freely.
+const NEAR      = { 2: 6, 3: 8, 4: 10, 5: 12 };
 const SETTLE    = 8000 + 20000; // HOLD + FADE in presence.html: after this a trace is pure residue
 
 // ---- HTTP: serve the page ---------------------------------------------------
@@ -31,13 +33,13 @@ const cells = new Map();
 const KEY = (c, r) => r * 100000 + c;
 
 // ---- Grouping ---------------------------------------------------------------
-const near = (a, b) => Math.abs(a.c - b.c) <= NEAR && Math.abs(a.r - b.r) <= NEAR;
+const near = (a, b, d) => Math.abs(a.c - b.c) <= d && Math.abs(a.r - b.r) <= d;
 
 // First MAX_USERS connections (by join order) are the active participants.
 const activeUsers = () => [...users.values()].sort((a, b) => a.id - b.id).slice(0, MAX_USERS);
 
-// A set of people is a group only if EVERY pair is near (no chains).
-const isGroup = set => set.every((a, i) => set.slice(i + 1).every(b => near(a, b)));
+// A set of people is a group only if EVERY pair is within that group size's field (no chains).
+const isGroup = set => set.every((a, i) => set.slice(i + 1).every(b => near(a, b, NEAR[set.length] ?? 0)));
 
 // Ranking between candidate groups: bigger first, then tighter (largest pairwise
 // distance, then sum of pairwise distances), then join order. Fully deterministic.
